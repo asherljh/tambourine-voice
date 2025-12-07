@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="app/src-tauri/icons/icon.png" alt="Tambourine" width="128" height="128">
+</p>
+
 # Tambourine
 
 Customizable AI powered voice dictation tool. Open-source alternative to [Wispr Flow](https://wisprflow.ai) and [Superwhisper](https://superwhisper.com). Speak and your words are typed wherever your cursor is.
