@@ -70,21 +70,7 @@ body {
 .sidebar-logo {
 	display: flex;
 	align-items: center;
-	gap: 10px;
-}
-
-.sidebar-logo-icon {
-	width: 32px;
-	height: 32px;
-	background: var(--accent-primary);
-	border-radius: 8px;
-	display: flex;
-	align-items: center;
-	justify-content: center;
-	color: #000;
-	font-weight: 700;
-	font-size: 14px;
-	font-family: "Sora", sans-serif;
+	gap: 5px;
 }
 
 .sidebar-title {
@@ -456,6 +442,7 @@ body {
 		opacity: 0;
 		transform: translateY(8px);
 	}
+
 	to {
 		opacity: 1;
 		transform: translateY(0);
@@ -470,14 +457,17 @@ body {
 	animation-delay: 0.05s;
 	opacity: 0;
 }
+
 .animate-in-delay-2 {
 	animation-delay: 0.1s;
 	opacity: 0;
 }
+
 .animate-in-delay-3 {
 	animation-delay: 0.15s;
 	opacity: 0;
 }
+
 .animate-in-delay-4 {
 	animation-delay: 0.2s;
 	opacity: 0;

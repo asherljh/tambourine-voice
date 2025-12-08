@@ -5,7 +5,7 @@ interface LogoProps {
 	className?: string;
 }
 
-export function Logo({ size = 16, className }: LogoProps) {
+export function Logo({ size = 48, className }: LogoProps) {
 	return (
 		<LogoSvg
 			width={size}
@@ -13,7 +13,7 @@ export function Logo({ size = 16, className }: LogoProps) {
 			className={className}
 			role="img"
 			aria-label="Voice logo"
-			style={{ fill: "currentColor" }}
+			style={{ fill: "white" }}
 		/>
 	);
 }

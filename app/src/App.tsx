@@ -98,10 +98,8 @@ function Sidebar({
 		<aside className="sidebar">
 			<header className="sidebar-header">
 				<div className="sidebar-logo">
-					<div className="sidebar-logo-icon">
-						<Logo size={16} />
-					</div>
-					<span className="sidebar-title">Voice</span>
+					<Logo size={32} />
+					<span className="sidebar-title">Tambourine</span>
 				</div>
 			</header>
 
@@ -196,7 +194,7 @@ function HomeView() {
 					Welcome back
 				</Title>
 				<Text c="dimmed" size="sm">
-					Your Tambourine history
+					~-~-~-~-~-~
 				</Text>
 			</header>
 
