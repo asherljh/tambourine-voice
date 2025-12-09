@@ -5,7 +5,7 @@ use std::thread;
 use std::time::Duration;
 use tauri::AppHandle;
 
-const SERVER_URL: &str = "ws://127.0.0.1:8765";
+const SERVER_URL: &str = "http://127.0.0.1:8765";
 
 #[tauri::command]
 pub async fn get_server_url() -> String {

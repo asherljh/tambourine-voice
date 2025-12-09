@@ -12,63 +12,39 @@ type ConnectionState =
 	| "recording" // Mic enabled, streaming audio
 	| "processing"; // Waiting for server response
 
-/** Information about the current retry attempt */
-export interface RetryInfo {
-	attemptNumber: number;
-	nextRetryMs: number;
-}
-
 interface RecordingState {
 	state: ConnectionState;
 	client: PipecatClient | null;
-	serverUrl: string | null;
-	/** Information about current retry attempt (null if not retrying) */
-	retryInfo: RetryInfo | null;
 
 	// Actions
 	setClient: (client: PipecatClient | null) => void;
-	setServerUrl: (url: string | null) => void;
 	setState: (state: ConnectionState) => void;
-	setRetryInfo: (info: RetryInfo | null) => void;
 
 	// State transitions
-	startConnecting: () => void;
 	handleConnected: () => void;
 	handleDisconnected: () => void;
 	startRecording: () => Promise<boolean>; // Returns false if not in valid state
 	stopRecording: () => boolean; // Returns false if not in valid state
 	handleResponse: () => void;
-	reset: () => void;
 }
 
 export const useRecordingStore = create<RecordingState>((set, get) => ({
 	state: "disconnected",
 	client: null,
-	serverUrl: null,
-	retryInfo: null,
 
 	setClient: (client) => set({ client }),
-	setServerUrl: (serverUrl) => set({ serverUrl }),
 	setState: (state) => set({ state }),
-	setRetryInfo: (retryInfo) => set({ retryInfo }),
-
-	startConnecting: () => {
-		const currentState = get().state;
-		if (currentState === "disconnected") {
-			set({ state: "connecting" });
-		}
-	},
 
 	handleConnected: () => {
 		const currentState = get().state;
 		if (currentState === "connecting" || currentState === "disconnected") {
-			set({ state: "idle", retryInfo: null });
+			set({ state: "idle" });
 		}
 	},
 
 	handleDisconnected: () => {
-		// Reset state fully - client will be recreated and set via setClient
-		set({ state: "disconnected", retryInfo: null, client: null });
+		// Only reset connection state - keep client reference since we reuse it for reconnection
+		set({ state: "disconnected" });
 	},
 
 	startRecording: async () => {
@@ -161,6 +137,4 @@ export const useRecordingStore = create<RecordingState>((set, get) => ({
 			set({ state: "idle" });
 		}
 	},
-
-	reset: () => set({ state: "disconnected", client: null, retryInfo: null }),
 }));

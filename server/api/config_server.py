@@ -1,11 +1,10 @@
-"""FastAPI configuration server for Tambourine settings."""
+"""FastAPI configuration router for Tambourine settings."""
 
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi import APIRouter
 from loguru import logger
 from pydantic import BaseModel
 
@@ -30,15 +29,8 @@ if TYPE_CHECKING:
     from config.settings import Settings
     from processors.llm_cleanup import TranscriptionToLLMConverter
 
-app = FastAPI(title="Tambourine Config API")
-
-# CORS for Tauri frontend
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# Create router for config endpoints
+config_router = APIRouter()
 
 # Shared state - will be set by main server
 _llm_converter: TranscriptionToLLMConverter | None = None
@@ -144,7 +136,7 @@ class SetPromptResponse(BaseModel):
     error: str | None = None
 
 
-@app.get("/api/prompt/sections/default", response_model=DefaultSectionsResponse)
+@config_router.get("/api/prompt/sections/default", response_model=DefaultSectionsResponse)
 async def get_default_sections() -> DefaultSectionsResponse:
     """Get default prompts for each section."""
     return DefaultSectionsResponse(
@@ -153,7 +145,7 @@ async def get_default_sections() -> DefaultSectionsResponse:
     )
 
 
-@app.post("/api/prompt/sections", response_model=SetPromptResponse)
+@config_router.post("/api/prompt/sections", response_model=SetPromptResponse)
 async def set_prompt_sections(data: PromptSectionsUpdate) -> SetPromptResponse:
     """Update prompt sections and combine them into the active prompt.
 
@@ -215,7 +207,7 @@ class SwitchProviderResponse(BaseModel):
 # Provider Endpoints
 
 
-@app.get("/api/providers/available", response_model=AvailableProvidersResponse)
+@config_router.get("/api/providers/available", response_model=AvailableProvidersResponse)
 async def get_available_providers() -> AvailableProvidersResponse:
     """Get list of available STT and LLM providers (those with API keys configured)."""
     stt_providers = []
@@ -236,7 +228,7 @@ async def get_available_providers() -> AvailableProvidersResponse:
     return AvailableProvidersResponse(stt=stt_providers, llm=llm_providers)
 
 
-@app.get("/api/providers/current", response_model=CurrentProvidersResponse)
+@config_router.get("/api/providers/current", response_model=CurrentProvidersResponse)
 async def get_current_providers() -> CurrentProvidersResponse:
     """Get currently active STT and LLM providers."""
     return CurrentProvidersResponse(
@@ -245,7 +237,7 @@ async def get_current_providers() -> CurrentProvidersResponse:
     )
 
 
-@app.post("/api/providers/stt", response_model=SwitchProviderResponse)
+@config_router.post("/api/providers/stt", response_model=SwitchProviderResponse)
 async def switch_stt_provider(data: SwitchProviderRequest) -> SwitchProviderResponse:
     """Switch to a different STT provider.
 
@@ -275,7 +267,7 @@ async def switch_stt_provider(data: SwitchProviderRequest) -> SwitchProviderResp
     return SwitchProviderResponse(success=True, provider=provider.value)
 
 
-@app.post("/api/providers/llm", response_model=SwitchProviderResponse)
+@config_router.post("/api/providers/llm", response_model=SwitchProviderResponse)
 async def switch_llm_provider(data: SwitchProviderRequest) -> SwitchProviderResponse:
     """Switch to a different LLM provider.
 

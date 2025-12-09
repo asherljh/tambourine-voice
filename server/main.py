@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Tambourine Server - WebSocket-based Pipecat Server.
+"""Tambourine Server - SmallWebRTC-based Pipecat Server.
 
-A WebSocket server that receives audio from a Tauri client,
+A FastAPI server that receives audio from a Tauri client via WebRTC,
 processes it through STT and LLM cleanup, and returns cleaned text.
 
 Usage:
@@ -9,11 +9,14 @@ Usage:
     python main.py --port 8765
 """
 
+import argparse
 import asyncio
+from contextlib import asynccontextmanager
 from typing import Any, cast
 
-import typer
 import uvicorn
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from loguru import logger
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.frames.frames import (
@@ -32,14 +35,15 @@ from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.service_switcher import ServiceSwitcher, ServiceSwitcherStrategyManual
 from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
-from pipecat.serializers.protobuf import ProtobufFrameSerializer
-from pipecat.transports.websocket.server import (
-    WebsocketServerParams,
-    WebsocketServerTransport,
-)
+from pipecat.transports.base_transport import TransportParams
+from pipecat.transports.smallwebrtc.connection import IceServer, SmallWebRTCConnection
+from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
 
-from api.config_server import app as config_api_app
-from api.config_server import set_llm_converter, set_service_switchers
+from api.config_server import (
+    config_router,
+    set_llm_converter,
+    set_service_switchers,
+)
 from config.settings import Settings
 from processors.llm_cleanup import LLMResponseToRTVIConverter, TranscriptionToLLMConverter
 from processors.transcription_buffer import TranscriptionBufferProcessor
@@ -51,8 +55,21 @@ from services.providers import (
 )
 from utils.logger import configure_logging
 
-# CLI app
-app = typer.Typer(help="Tambourine WebSocket server")
+# Store peer connections by pc_id
+peer_connections_map: dict[str, SmallWebRTCConnection] = {}
+
+# Track running pipeline tasks for clean shutdown
+pipeline_tasks: set[asyncio.Task[None]] = set()
+
+# ICE servers for WebRTC NAT traversal
+ice_servers = [
+    IceServer(urls="stun:stun.l.google.com:19302"),
+]
+
+# Shared state for the pipeline components
+_settings: Settings | None = None
+_stt_services: dict[STTProvider, Any] | None = None
+_llm_services: dict[LLMProvider, Any] | None = None
 
 
 class DebugFrameProcessor(FrameProcessor):
@@ -115,52 +132,35 @@ class TextResponseProcessor(FrameProcessor):
         await self.push_frame(frame, direction)
 
 
-async def run_server(host: str, port: int, settings: Settings) -> None:
-    """Run the WebSocket dictation server.
+async def run_pipeline(webrtc_connection: SmallWebRTCConnection) -> None:
+    """Run the Pipecat pipeline for a single WebRTC connection.
 
     Args:
-        host: Host to bind to
-        port: Port to listen on
-        settings: Application settings
+        webrtc_connection: The SmallWebRTCConnection instance for this client
     """
-    logger.info(f"Starting WebSocket server on ws://{host}:{port}")
+    logger.info("Starting pipeline for new WebRTC connection")
 
-    # Create WebSocket transport with protobuf serializer for pipecat-ai/client-js compatibility
-    # VAD filters background noise - only speech is processed by STT
-    transport = WebsocketServerTransport(
-        host=host,
-        port=port,
-        params=WebsocketServerParams(
+    if not _settings or not _stt_services or not _llm_services:
+        logger.error("Server not properly initialized")
+        return
+
+    # Create transport using the WebRTC connection
+    # audio_in_stream_on_start=False prevents timeout warnings when mic is disabled
+    transport = SmallWebRTCTransport(
+        webrtc_connection=webrtc_connection,
+        params=TransportParams(
             audio_in_enabled=True,
             audio_out_enabled=False,  # No audio output for dictation
-            serializer=ProtobufFrameSerializer(),  # Required for @pipecat-ai/websocket-transport
+            audio_in_stream_on_start=False,  # Don't expect audio until client enables mic
             vad_analyzer=SileroVADAnalyzer(),
         ),
     )
 
-    # Initialize services - create all available providers for switching
-    stt_services = create_all_available_stt_services(settings)
-    llm_services = create_all_available_llm_services(settings)
+    # Create service switchers for this connection
+    from pipecat.pipeline.base_pipeline import FrameProcessor as PipecatFrameProcessor
 
-    if not stt_services:
-        logger.error("No STT providers available. Configure at least one STT API key.")
-        raise RuntimeError("No STT providers configured")
-
-    if not llm_services:
-        logger.error("No LLM providers available. Configure at least one LLM API key.")
-        raise RuntimeError("No LLM providers configured")
-
-    # Log available providers
-    logger.info(f"Available STT providers: {[p.value for p in stt_services]}")
-    logger.info(f"Available LLM providers: {[p.value for p in llm_services]}")
-
-    # Create service switchers for runtime provider switching
-    # Note: ServiceSwitcher expects List[FrameProcessor], but STTService/LLMService
-    # are subclasses of AIService which inherits from FrameProcessor
-    from pipecat.pipeline.base_pipeline import FrameProcessor
-
-    stt_service_list = cast(list[FrameProcessor], list(stt_services.values()))
-    llm_service_list = list(llm_services.values())
+    stt_service_list = cast(list[PipecatFrameProcessor], list(_stt_services.values()))
+    llm_service_list = list(_llm_services.values())
 
     stt_switcher = ServiceSwitcher(
         services=stt_service_list,
@@ -173,22 +173,17 @@ async def run_server(host: str, port: int, settings: Settings) -> None:
     )
 
     # Set active provider to default (only if explicitly configured)
-    # Pipecat uses the first service in the list as default, so we only override if specified
-    if settings.default_stt_provider:
-        default_stt = STTProvider(settings.default_stt_provider)
-        if default_stt in stt_services:
-            stt_switcher.strategy.active_service = stt_services[default_stt]
+    if _settings.default_stt_provider:
+        default_stt = STTProvider(_settings.default_stt_provider)
+        if default_stt in _stt_services:
+            stt_switcher.strategy.active_service = _stt_services[default_stt]
             logger.info(f"Default STT provider: {default_stt.value}")
-        else:
-            logger.warning(f"Default STT provider '{default_stt.value}' not available")
 
-    if settings.default_llm_provider:
-        default_llm = LLMProvider(settings.default_llm_provider)
-        if default_llm in llm_services:
-            llm_switcher.strategy.active_service = llm_services[default_llm]
+    if _settings.default_llm_provider:
+        default_llm = LLMProvider(_settings.default_llm_provider)
+        if default_llm in _llm_services:
+            llm_switcher.strategy.active_service = _llm_services[default_llm]
             logger.info(f"Default LLM provider: {default_llm.value}")
-        else:
-            logger.warning(f"Default LLM provider '{default_llm.value}' not available")
 
     # Initialize processors
     debug_input = DebugFrameProcessor(name="input")
@@ -201,31 +196,26 @@ async def run_server(host: str, port: int, settings: Settings) -> None:
     set_service_switchers(
         stt_switcher=stt_switcher,
         llm_switcher=llm_switcher,
-        stt_services=stt_services,
-        llm_services=llm_services,
-        settings=settings,
+        stt_services=_stt_services,
+        llm_services=_llm_services,
+        settings=_settings,
     )
     llm_response_converter = LLMResponseToRTVIConverter()
     text_response = TextResponseProcessor()
 
-    # Build pipeline: Audio -> STT Switcher -> Buffer -> LLM Converter -> LLM Switcher -> Response
-    # Uses idiomatic Pipecat frame-based pattern with service switchers:
-    # 1. STT Switcher: Routes to active STT provider
-    # 2. TranscriptionToLLMConverter: Converts transcription to OpenAILLMContextFrame
-    # 3. LLM Switcher: Routes to active LLM provider
-    # 4. LLMResponseToRTVIConverter: Aggregates response and sends RTVI message
+    # Build pipeline
     pipeline = Pipeline(
         [
-            transport.input(),  # Audio from Tauri client
-            debug_input,  # Debug: log all incoming frames
-            stt_switcher,  # STT switcher (routes to active provider)
-            debug_after_stt,  # Debug: log frames after STT
-            transcription_buffer,  # Buffer until user stops speaking
-            transcription_to_llm,  # Convert transcription to LLM context
-            llm_switcher,  # LLM switcher (routes to active provider)
-            llm_response_converter,  # Aggregate and convert to RTVI message
-            text_response,  # Log outgoing text
-            transport.output(),  # Send text back to client
+            transport.input(),
+            debug_input,
+            stt_switcher,
+            debug_after_stt,
+            transcription_buffer,
+            transcription_to_llm,
+            llm_switcher,
+            llm_response_converter,
+            text_response,
+            transport.output(),
         ]
     )
 
@@ -237,86 +227,178 @@ async def run_server(host: str, port: int, settings: Settings) -> None:
             enable_metrics=True,
             enable_usage_metrics=True,
         ),
-        idle_timeout_secs=None,  # Disable idle timeout - client manages connection
+        idle_timeout_secs=None,
     )
 
     # Set up event handlers
     @transport.event_handler("on_client_connected")
     async def on_client_connected(_transport: Any, client: Any) -> None:
-        logger.info(f"Client connected: {client}")
+        logger.info(f"Client connected via WebRTC: {client}")
 
     @transport.event_handler("on_client_disconnected")
     async def on_client_disconnected(_transport: Any, client: Any) -> None:
         logger.info(f"Client disconnected: {client}")
+        await task.cancel()
 
-    # Run the server
-    runner = PipelineRunner(handle_sigint=True)
-
-    # Configure FastAPI/uvicorn server for config API
-    api_port = port + 1  # Config API runs on port 8766 if WebSocket is on 8765
-    uvicorn_config = uvicorn.Config(
-        config_api_app,
-        host=host,
-        port=api_port,
-        log_level="warning",  # Reduce noise from uvicorn
-    )
-    api_server = uvicorn.Server(uvicorn_config)
-
-    logger.info("=" * 60)
-    logger.success("Tambourine Server Ready!")
-    logger.info("=" * 60)
-    logger.info(f"WebSocket endpoint: ws://{host}:{port}")
-    logger.info(f"Config API endpoint: http://{host}:{api_port}")
-    logger.info("Waiting for Tauri client connection...")
-    logger.info("Press Ctrl+C to stop")
-    logger.info("=" * 60)
-
-    try:
-        # Run both servers concurrently
-        await asyncio.gather(
-            runner.run(task),
-            api_server.serve(),
-        )
-    except asyncio.CancelledError:
-        logger.info("Server stopped")
-    except Exception as e:
-        logger.error(f"Server error: {e}")
-        raise
+    # Run the pipeline
+    runner = PipelineRunner(handle_sigint=False)
+    await runner.run(task)
 
 
-@app.command()
-def main(
-    host: str = typer.Option(
-        "127.0.0.1",
-        "--host",
-        "-h",
-        help="Host to bind to",
-    ),
-    port: int = typer.Option(
-        8765,
-        "--port",
-        "-p",
-        help="Port to listen on",
-    ),
-    verbose: bool = typer.Option(
-        False,
-        "--verbose",
-        "-v",
-        help="Enable verbose logging",
-    ),
-) -> None:
-    """Start the Tambourine WebSocket server.
+def initialize_services(settings: Settings) -> bool:
+    """Initialize STT and LLM services.
 
-    Examples:
-        dictation-server
-        dictation-server --port 9000
-        dictation-server --host 0.0.0.0 --port 8765
+    Args:
+        settings: Application settings
+
+    Returns:
+        True if services were initialized successfully
     """
-    # Configure logging (verbose flag overrides LOG_LEVEL env var)
-    log_level = "DEBUG" if verbose else None
+    global _settings, _stt_services, _llm_services
+
+    _settings = settings
+    _stt_services = create_all_available_stt_services(settings)
+    _llm_services = create_all_available_llm_services(settings)
+
+    if not _stt_services:
+        logger.error("No STT providers available. Configure at least one STT API key.")
+        return False
+
+    if not _llm_services:
+        logger.error("No LLM providers available. Configure at least one LLM API key.")
+        return False
+
+    logger.info(f"Available STT providers: {[p.value for p in _stt_services]}")
+    logger.info(f"Available LLM providers: {[p.value for p in _llm_services]}")
+
+    return True
+
+
+@asynccontextmanager
+async def lifespan(_fastapi_app: FastAPI):  # noqa: ANN201
+    """FastAPI lifespan context manager for cleanup."""
+    yield
+    logger.info("Shutting down server...")
+
+    # Cancel all running pipeline tasks first
+    for task in pipeline_tasks:
+        task.cancel()
+    if pipeline_tasks:
+        # Wait for tasks to finish with a timeout
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*pipeline_tasks, return_exceptions=True),
+                timeout=2.0,
+            )
+            logger.info("All pipeline tasks cancelled")
+        except TimeoutError:
+            logger.warning("Timeout waiting for pipeline tasks, forcing shutdown")
+        pipeline_tasks.clear()
+
+    # Disconnect all peer connections with timeout
+    coros = [pc.disconnect() for pc in peer_connections_map.values()]
+    if coros:
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*coros, return_exceptions=True),
+                timeout=2.0,
+            )
+            logger.info("All peer connections cleaned up")
+        except TimeoutError:
+            logger.warning("Timeout waiting for peer connections, forcing shutdown")
+    peer_connections_map.clear()
+
+
+# Create FastAPI app
+app = FastAPI(title="Tambourine Server", lifespan=lifespan)
+
+# CORS for Tauri frontend
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Include config routes
+app.include_router(config_router)
+
+
+@app.post("/api/offer")
+async def webrtc_offer(request: dict[str, Any]) -> dict[str, Any]:
+    """Handle WebRTC offer from client.
+
+    This endpoint handles the WebRTC signaling handshake:
+    1. Receives SDP offer from client
+    2. Creates or reuses a SmallWebRTCConnection
+    3. Returns SDP answer to client
+    4. Starts the Pipecat pipeline in the background
+
+    Args:
+        request: WebRTC offer containing sdp, type, and optional pc_id
+
+    Returns:
+        WebRTC answer with sdp, type, and pc_id
+    """
+    pc_id = request.get("pc_id")
+
+    if pc_id and pc_id in peer_connections_map:
+        # Reuse existing connection (renegotiation)
+        pipecat_connection = peer_connections_map[pc_id]
+        logger.info(f"Reusing existing connection for pc_id: {pc_id}")
+        await pipecat_connection.renegotiate(
+            sdp=request["sdp"],
+            type=request["type"],
+            restart_pc=request.get("restart_pc", False),
+        )
+    else:
+        # Create new connection
+        pipecat_connection = SmallWebRTCConnection(ice_servers)
+        await pipecat_connection.initialize(sdp=request["sdp"], type=request["type"])
+
+        @pipecat_connection.event_handler("closed")
+        async def handle_disconnected(webrtc_connection: SmallWebRTCConnection) -> None:
+            logger.info(f"Discarding peer connection for pc_id: {webrtc_connection.pc_id}")
+            peer_connections_map.pop(webrtc_connection.pc_id, None)
+
+        # Run pipeline for this connection as tracked asyncio task
+        task = asyncio.create_task(run_pipeline(pipecat_connection))
+        pipeline_tasks.add(task)
+        task.add_done_callback(pipeline_tasks.discard)
+
+    answer = pipecat_connection.get_answer()
+    peer_connections_map[answer["pc_id"]] = pipecat_connection
+
+    return answer
+
+
+def main() -> None:
+    """Main entry point for the server."""
+    parser = argparse.ArgumentParser(description="Tambourine Server")
+    parser.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="Host to bind to (default: 127.0.0.1)",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=8765,
+        help="Port to listen on (default: 8765)",
+    )
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Enable verbose logging",
+    )
+    args = parser.parse_args()
+
+    # Configure logging
+    log_level = "DEBUG" if args.verbose else None
     configure_logging(log_level)
 
-    if verbose:
+    if args.verbose:
         logger.info("Verbose logging enabled")
 
     # Load settings
@@ -326,14 +408,30 @@ def main(
         logger.error(f"Configuration error: {e}")
         logger.warning("Please check your .env file and ensure all required API keys are set.")
         logger.info("See .env.example for reference.")
-        raise typer.Exit(1) from e
+        raise SystemExit(1) from e
 
-    # Run server
-    try:
-        asyncio.run(run_server(host, port, settings))
-    except KeyboardInterrupt:
-        logger.info("Server stopped by user")
+    # Initialize services
+    if not initialize_services(settings):
+        raise SystemExit(1)
+
+    logger.info("=" * 60)
+    logger.success("Tambourine Server Ready!")
+    logger.info("=" * 60)
+    logger.info(f"Server endpoint: http://{args.host}:{args.port}")
+    logger.info(f"WebRTC offer endpoint: http://{args.host}:{args.port}/api/offer")
+    logger.info(f"Config API endpoint: http://{args.host}:{args.port}/api/*")
+    logger.info("Waiting for Tauri client connection...")
+    logger.info("Press Ctrl+C to stop")
+    logger.info("=" * 60)
+
+    # Run the server
+    uvicorn.run(
+        app,
+        host=args.host,
+        port=args.port,
+        log_level="warning",
+    )
 
 
 if __name__ == "__main__":
-    app()
+    main()

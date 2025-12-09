@@ -15,12 +15,8 @@ import {
 	DEFAULT_TOGGLE_HOTKEY,
 } from "./lib/hotkeyDefaults";
 import { useSettings } from "./lib/queries";
-import {
-	type HotkeyConfig,
-	type RetryStatusPayload,
-	tauriAPI,
-} from "./lib/tauri";
-import { type RetryInfo, useRecordingStore } from "./stores/recordingStore";
+import { type HotkeyConfig, tauriAPI } from "./lib/tauri";
+import { useRecordingStore } from "./stores/recordingStore";
 import "./styles.css";
 
 type View = "home" | "settings";
@@ -28,59 +24,33 @@ type View = "home" | "settings";
 function ConnectionStatusIndicator() {
 	const state = useRecordingStore((s) => s.state);
 	const setState = useRecordingStore((s) => s.setState);
-	const setRetryInfo = useRecordingStore((s) => s.setRetryInfo);
-	const [retryInfo, setLocalRetryInfo] = useState<RetryInfo | null>(null);
 
 	// Listen for connection state changes from the overlay window
 	useEffect(() => {
-		let unlistenState: (() => void) | undefined;
-		let unlistenRetry: (() => void) | undefined;
+		let unlisten: (() => void) | undefined;
 
 		const setup = async () => {
-			unlistenState = await tauriAPI.onConnectionStateChanged((newState) => {
+			unlisten = await tauriAPI.onConnectionStateChanged((newState) => {
 				setState(newState);
-				// Clear retry info when connected or disconnected
-				if (newState === "idle" || newState === "disconnected") {
-					setLocalRetryInfo(null);
-					setRetryInfo(null);
-				}
 			});
-
-			unlistenRetry = await tauriAPI.onRetryStatusChanged(
-				(payload: RetryStatusPayload) => {
-					setState(payload.state);
-					setLocalRetryInfo(payload.retryInfo);
-					setRetryInfo(payload.retryInfo);
-				},
-			);
 		};
 
 		setup();
 
 		return () => {
-			unlistenState?.();
-			unlistenRetry?.();
+			unlisten?.();
 		};
-	}, [setState, setRetryInfo]);
+	}, [setState]);
 
 	const isConnected =
 		state === "idle" || state === "recording" || state === "processing";
 	const isConnecting = state === "connecting";
 
-	// Build status text with retry info
-	let statusText: string;
-	if (isConnecting) {
-		if (retryInfo) {
-			const seconds = Math.ceil(retryInfo.nextRetryMs / 1000);
-			statusText = `Reconnecting (attempt ${retryInfo.attemptNumber}, next in ${seconds}s)`;
-		} else {
-			statusText = "Connecting...";
-		}
-	} else if (isConnected) {
-		statusText = "Connected";
-	} else {
-		statusText = "Disconnected";
-	}
+	const statusText = isConnecting
+		? "Connecting..."
+		: isConnected
+			? "Connected"
+			: "Disconnected";
 
 	return (
 		<Tooltip label={statusText} position="right" withArrow>

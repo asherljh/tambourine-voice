@@ -5,13 +5,9 @@ import {
 	PipecatClientProvider,
 	usePipecatClient,
 } from "@pipecat-ai/client-react";
+import { SmallWebRTCTransport } from "@pipecat-ai/small-webrtc-transport";
 import { ThemeProvider, UserAudioComponent } from "@pipecat-ai/voice-ui-kit";
-import {
-	ProtobufFrameSerializer,
-	WebSocketTransport,
-} from "@pipecat-ai/websocket-transport";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { useConnectionManager } from "./hooks/useConnectionManager";
 import {
 	useAddHistoryEntry,
 	useServerUrl,
@@ -49,14 +45,17 @@ function isRecordingCompleteMessage(
 	);
 }
 
-interface RecordingControlProps {
-	onNeedsClientRecreation: () => void;
-}
-
-function RecordingControl({ onNeedsClientRecreation }: RecordingControlProps) {
+function RecordingControl() {
 	const client = usePipecatClient();
-	const { state, setClient, startRecording, stopRecording, handleResponse } =
-		useRecordingStore();
+	const {
+		state,
+		setClient,
+		startRecording,
+		stopRecording,
+		handleResponse,
+		handleConnected,
+		handleDisconnected,
+	} = useRecordingStore();
 	const containerRef = useRef<HTMLDivElement>(null);
 
 	// Refs for click vs drag detection
@@ -64,30 +63,24 @@ function RecordingControl({ onNeedsClientRecreation }: RecordingControlProps) {
 	const mouseDownPositionRef = useRef<{ x: number; y: number } | null>(null);
 	const hasDragStartedRef = useRef<boolean>(false);
 
-	// Track last client recreation time to debounce rapid recreations
-	const lastRecreationTimeRef = useRef(0);
-	// Minimum delay between client recreations (ms)
-	const RECREATION_DEBOUNCE_MS = 2000;
-
 	const { data: serverUrl } = useServerUrl();
 	const { data: settings } = useSettings();
 
-	// Use the connection manager hook for connection lifecycle with exponential backoff
-	const { handlePipecatConnect, handlePipecatDisconnect } =
-		useConnectionManager({
-			client: client ?? null,
-			serverUrl: serverUrl ?? null,
-			onMidRecordingDisconnect: () => {
-				// Stop recording gracefully when connection drops mid-recording
-				if (client) {
-					try {
-						client.enableMic(false);
-					} catch {
-						// Ignore errors when disabling mic
-					}
-				}
-			},
-		});
+	// Track if we've ever connected (to distinguish initial connection from reconnection)
+	const hasConnectedRef = useRef(false);
+
+	// Simple connection: just call connect() when client and serverUrl are ready
+	// SmallWebRTC handles reconnection internally (3 attempts)
+	useEffect(() => {
+		if (!client || !serverUrl) return;
+
+		console.log("[Pipecat] Connecting to server...");
+		client
+			.connect({ webrtcRequestParams: { endpoint: `${serverUrl}/api/offer` } })
+			.catch((error: unknown) => {
+				console.error("[Pipecat] Initial connection failed:", error);
+			});
+	}, [client, serverUrl]);
 
 	// TanStack Query hooks
 	const typeTextMutation = useTypeText();
@@ -179,7 +172,8 @@ function RecordingControl({ onNeedsClientRecreation }: RecordingControlProps) {
 
 		const onConnected = () => {
 			console.log("[Pipecat] Connected to server");
-			handlePipecatConnect();
+			hasConnectedRef.current = true;
+			handleConnected();
 
 			// Sync cleanup prompt sections to server via REST API
 			// This ensures the server uses the saved prompt from Tauri settings
@@ -209,8 +203,38 @@ function RecordingControl({ onNeedsClientRecreation }: RecordingControlProps) {
 
 		const onDisconnected = () => {
 			console.log("[Pipecat] Disconnected from server");
-			// The connection manager handles reconnection with exponential backoff
-			handlePipecatDisconnect();
+
+			// Check if we were recording/processing when disconnect happened
+			const currentState = useRecordingStore.getState().state;
+			if (currentState === "recording" || currentState === "processing") {
+				console.warn("[Pipecat] Disconnected during recording/processing");
+				try {
+					client.enableMic(false);
+				} catch {
+					// Ignore errors when disabling mic
+				}
+			}
+
+			handleDisconnected();
+
+			// SmallWebRTC already tried to reconnect (3 attempts) and gave up
+			// Keep retrying with the same client - must call disconnect() first to reset state
+			if (hasConnectedRef.current && serverUrl) {
+				console.log("[Pipecat] SmallWebRTC gave up, will retry in 3s...");
+				setTimeout(async () => {
+					try {
+						// Must disconnect first to reset client state before reconnecting
+						await client.disconnect();
+						console.log("[Pipecat] Attempting to reconnect...");
+						await client.connect({
+							webrtcRequestParams: { endpoint: `${serverUrl}/api/offer` },
+						});
+					} catch (error: unknown) {
+						// Connection failed - the next Disconnected event will trigger another retry
+						console.error("[Pipecat] Reconnection attempt failed:", error);
+					}
+				}, 3000);
+			}
 		};
 
 		const onServerMessage = async (message: unknown) => {
@@ -260,28 +284,6 @@ function RecordingControl({ onNeedsClientRecreation }: RecordingControlProps) {
 
 		const onTransportStateChanged = (transportState: unknown) => {
 			console.log("[Pipecat] Transport state changed:", transportState);
-
-			// Recreate client on error with debounce to prevent rapid recreation loops
-			// The Pipecat client may be in a bad state after connection failure
-			// NOTE: Don't call handleDisconnected() here - it causes state changes that
-			// make the old connection manager try to reconnect before unmounting
-			if (transportState === "error") {
-				const now = Date.now();
-				const timeSinceLastRecreation = now - lastRecreationTimeRef.current;
-
-				if (timeSinceLastRecreation >= RECREATION_DEBOUNCE_MS) {
-					console.log(
-						"[Pipecat] Error state detected, recreating client (debounced)",
-					);
-					lastRecreationTimeRef.current = now;
-					// Just trigger recreation - state will reset when new client mounts
-					onNeedsClientRecreation();
-				} else {
-					console.log(
-						`[Pipecat] Error state detected, skipping recreation (${timeSinceLastRecreation}ms since last)`,
-					);
-				}
-			}
 		};
 
 		client.on(RTVIEvent.Connected, onConnected);
@@ -309,11 +311,11 @@ function RecordingControl({ onNeedsClientRecreation }: RecordingControlProps) {
 		};
 	}, [
 		client,
+		serverUrl,
 		settings,
-		handlePipecatConnect,
-		handlePipecatDisconnect,
+		handleConnected,
+		handleDisconnected,
 		handleResponse,
-		onNeedsClientRecreation,
 		typeTextMutation,
 		addHistoryEntry,
 		clearResponseTimeout,
@@ -448,73 +450,13 @@ function RecordingControl({ onNeedsClientRecreation }: RecordingControlProps) {
 export default function OverlayApp() {
 	const [client, setClient] = useState<PipecatClient | null>(null);
 	const [devicesReady, setDevicesReady] = useState(false);
-	// Track if we're recreating the client (to prevent rendering with stale client)
-	const [isRecreating, setIsRecreating] = useState(false);
 	const { data: settings } = useSettings();
-
-	// Callback to recreate client when connection fails
-	const handleClientRecreation = useCallback(() => {
-		console.log("[OverlayApp] Client recreation requested");
-		// Mark as recreating first - this will unmount RecordingControl
-		setIsRecreating(true);
-	}, []);
-
-	// Ref to access current client without adding it to effect dependencies
-	const clientRef = useRef<PipecatClient | null>(null);
-	clientRef.current = client;
-
-	// Handle client recreation when isRecreating becomes true
-	useEffect(() => {
-		if (!isRecreating) return;
-
-		console.log("[OverlayApp] Recreation triggered, cleaning up old client...");
-
-		// Reset store state to "disconnected" so UI shows spinner during reconnection
-		// This must happen before new client is created so useConnectionManager sees correct state
-		useRecordingStore.getState().handleDisconnected();
-
-		// Clean up old client first (using ref to avoid dependency)
-		if (clientRef.current) {
-			clientRef.current.disconnect().catch(() => {});
-		}
-		setClient(null);
-		setDevicesReady(false);
-
-		// Create new client after a brief delay to ensure cleanup completes
-		const timeoutId = setTimeout(() => {
-			console.log("[OverlayApp] Creating new client...");
-			const transport = new WebSocketTransport({
-				serializer: new ProtobufFrameSerializer(),
-			});
-			const pipecatClient = new PipecatClient({
-				transport,
-				enableMic: false,
-				enableCam: false,
-			});
-			setClient(pipecatClient);
-
-			pipecatClient
-				.initDevices()
-				.then(() => {
-					console.log("[OverlayApp] Devices ready (recreation)");
-					setDevicesReady(true);
-					setIsRecreating(false);
-				})
-				.catch((error: unknown) => {
-					console.error("Failed to initialize devices:", error);
-					setDevicesReady(true);
-					setIsRecreating(false);
-				});
-		}, 100);
-
-		return () => clearTimeout(timeoutId);
-	}, [isRecreating]);
 
 	// Initial client creation on mount
 	useEffect(() => {
 		console.log("[OverlayApp] Initial client creation...");
-		const transport = new WebSocketTransport({
-			serializer: new ProtobufFrameSerializer(),
+		const transport = new SmallWebRTCTransport({
+			iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
 		});
 		const pipecatClient = new PipecatClient({
 			transport,
@@ -547,7 +489,7 @@ export default function OverlayApp() {
 		}
 	}, [client, devicesReady, settings?.selected_mic_id]);
 
-	if (!client || !devicesReady || isRecreating) {
+	if (!client || !devicesReady) {
 		return (
 			<div
 				className="flex items-center justify-center"
@@ -566,7 +508,7 @@ export default function OverlayApp() {
 	return (
 		<ThemeProvider>
 			<PipecatClientProvider client={client}>
-				<RecordingControl onNeedsClientRecreation={handleClientRecreation} />
+				<RecordingControl />
 			</PipecatClientProvider>
 		</ThemeProvider>
 	);

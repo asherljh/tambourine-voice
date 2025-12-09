@@ -9,15 +9,6 @@ export type ConnectionState =
 	| "recording"
 	| "processing";
 
-/** Information about retry status for cross-window communication */
-export interface RetryStatusPayload {
-	state: ConnectionState;
-	retryInfo: {
-		attemptNumber: number;
-		nextRetryMs: number;
-	} | null;
-}
-
 interface TypeTextResult {
 	success: boolean;
 	error?: string;
@@ -82,10 +73,6 @@ export const tauriAPI = {
 	// Settings API
 	async getSettings(): Promise<AppSettings> {
 		return invoke("get_settings");
-	},
-
-	async saveSettings(settings: AppSettings): Promise<void> {
-		return invoke("save_settings", { settings });
 	},
 
 	async updateToggleHotkey(hotkey: HotkeyConfig): Promise<void> {
@@ -189,19 +176,6 @@ export const tauriAPI = {
 		);
 	},
 
-	// Retry status sync between windows (includes retry info)
-	async emitRetryStatus(payload: RetryStatusPayload): Promise<void> {
-		return emit("retry-status-changed", payload);
-	},
-
-	async onRetryStatusChanged(
-		callback: (payload: RetryStatusPayload) => void,
-	): Promise<UnlistenFn> {
-		return listen<RetryStatusPayload>("retry-status-changed", (event) => {
-			callback(event.payload);
-		});
-	},
-
 	// History sync between windows
 	async emitHistoryChanged(): Promise<void> {
 		return emit("history-changed", {});
@@ -215,7 +189,8 @@ export const tauriAPI = {
 };
 
 // Config API for server-side settings (FastAPI)
-const CONFIG_API_URL = "http://127.0.0.1:8766";
+// Now merged with main server (WebRTC + Config on same port)
+const CONFIG_API_URL = "http://127.0.0.1:8765";
 
 export interface DefaultSectionsResponse {
 	main: string;
