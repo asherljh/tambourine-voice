@@ -205,6 +205,11 @@ pub fn handle_shortcut_event(app: &AppHandle, shortcut: &Shortcut, event: &Short
         match event.state {
             ShortcutState::Pressed => {
                 state.toggle_key_held.swap(true, Ordering::SeqCst);
+                // Emit prepare event to start mic acquisition early (before key release)
+                // This allows the frontend to pre-warm the microphone while user holds the key
+                if !state.is_recording.load(Ordering::SeqCst) {
+                    let _ = app.emit("prepare-recording", ());
+                }
             }
             ShortcutState::Released => {
                 if state.toggle_key_held.swap(false, Ordering::SeqCst) {

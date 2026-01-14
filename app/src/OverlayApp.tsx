@@ -112,6 +112,11 @@ function RecordingControl() {
 	// Ref for tracking drag state
 	const hasDragStartedRef = useRef(false);
 
+	// State and refs for mic acquisition optimization
+	const [isMicAcquiring, setIsMicAcquiring] = useState(false);
+	const micPreparedRef = useRef(false);
+	const lastMicIdRef = useRef<string | null>(null);
+
 	const { data: serverUrl } = useServerUrl();
 	const { data: settings } = useSettings();
 
@@ -196,12 +201,34 @@ function RecordingControl() {
 
 	// Handle start/stop recording from hotkeys
 	const onStartRecording = useCallback(async () => {
-		// Apply selected mic from settings before starting recording
-		// This ensures the user's preferred mic is used, even on first recording
-		if (client && settings?.selected_mic_id) {
-			await client.updateMic(settings.selected_mic_id);
+		// Always show loading indicator during mic acquisition and recording start
+		// This ensures accurate UX feedback even when mic is pre-warmed
+		setIsMicAcquiring(true);
+
+		// Allow React to process the state update and show the loading indicator
+		// before we start the async mic operations
+		await new Promise((resolve) => setTimeout(resolve, 0));
+
+		try {
+			// Skip mic acquisition if already pre-warmed by prepare-recording event
+			if (!micPreparedRef.current && client && settings?.selected_mic_id) {
+				// Only update mic if device changed from last recording
+				if (lastMicIdRef.current !== settings.selected_mic_id) {
+					await client.updateMic(settings.selected_mic_id);
+					lastMicIdRef.current = settings.selected_mic_id;
+				}
+			}
+
+			// Reset prepared state for next recording
+			micPreparedRef.current = false;
+
+			// startRecording() calls enableMic(true) which also takes time
+			await startRecording();
+		} catch (error) {
+			console.warn("[Recording] Failed to start recording:", error);
+		} finally {
+			setIsMicAcquiring(false);
 		}
-		await startRecording();
 	}, [client, settings?.selected_mic_id, startRecording]);
 
 	const onStopRecording = useCallback(() => {
@@ -227,6 +254,43 @@ function RecordingControl() {
 			unlistenStop?.();
 		};
 	}, [onStartRecording, onStopRecording]);
+
+	// Listen for prepare-recording event (toggle key press) to pre-warm microphone
+	// This reduces perceived latency by acquiring the mic while user holds the key
+	useEffect(() => {
+		let unlisten: (() => void) | undefined;
+
+		const setup = async () => {
+			unlisten = await tauriAPI.onPrepareRecording(async () => {
+				// Only prepare if we're idle and have a mic selected
+				if (
+					client &&
+					settings?.selected_mic_id &&
+					!micPreparedRef.current &&
+					state === "idle"
+				) {
+					// Only acquire mic if device changed from last recording
+					if (lastMicIdRef.current !== settings.selected_mic_id) {
+						setIsMicAcquiring(true);
+						try {
+							await client.updateMic(settings.selected_mic_id);
+							lastMicIdRef.current = settings.selected_mic_id;
+						} catch (error) {
+							console.warn("[Recording] Failed to pre-warm mic:", error);
+						}
+						setIsMicAcquiring(false);
+					}
+					micPreparedRef.current = true;
+				}
+			});
+		};
+
+		setup();
+
+		return () => {
+			unlisten?.();
+		};
+	}, [client, settings?.selected_mic_id, state]);
 
 	// Listen for settings changes from main window and invalidate cache to trigger sync
 	useEffect(() => {
@@ -608,7 +672,8 @@ function RecordingControl() {
 		>
 			{state === "processing" ||
 			state === "disconnected" ||
-			state === "connecting" ? (
+			state === "connecting" ||
+			isMicAcquiring ? (
 				<div
 					style={{
 						width: 48,

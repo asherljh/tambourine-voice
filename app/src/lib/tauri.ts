@@ -212,6 +212,10 @@ export const tauriAPI = {
 		return listen("recording-stop", callback);
 	},
 
+	async onPrepareRecording(callback: () => void): Promise<UnlistenFn> {
+		return listen("prepare-recording", callback);
+	},
+
 	// Settings API - using store plugin directly
 	async getSettings(): Promise<AppSettings> {
 		const store = await getStore();
