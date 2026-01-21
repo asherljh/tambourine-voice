@@ -10,6 +10,18 @@ import {
 import { type ConnectionState, configAPI, tauriAPI } from "../lib/tauri";
 
 /**
+ * Clears the transport's keepAliveInterval to prevent "InvalidStateError" spam.
+ * The library's stop() has a bug where the interval isn't cleared on abrupt disconnects.
+ */
+function clearKeepAliveInterval(client: PipecatClient): void {
+	const transport = client.transport as { keepAliveInterval?: NodeJS.Timeout };
+	if (transport?.keepAliveInterval) {
+		clearInterval(transport.keepAliveInterval);
+		transport.keepAliveInterval = undefined;
+	}
+}
+
+/**
  * XState-based connection state machine for managing PipecatClient lifecycle.
  *
  * This machine handles:
@@ -42,21 +54,6 @@ type ConnectionEvents =
 	| { type: "SERVER_URL_CHANGED"; serverUrl: string }
 	| { type: "COMMUNICATION_ERROR"; error: string }
 	| { type: "UUID_REJECTED" };
-
-/**
- * Closes the RTCPeerConnection immediately to prevent the library's internal
- * event handlers from sending messages during disconnect (which causes errors).
- */
-function closePeerConnectionImmediately(client: PipecatClient): void {
-	try {
-		const transport = client.transport as SmallWebRTCTransport;
-		const peerConnection = (transport as unknown as { pc?: RTCPeerConnection })
-			.pc;
-		peerConnection?.close();
-	} catch {
-		// Peer connection may not exist yet
-	}
-}
 
 // Actor that creates a fresh PipecatClient instance and ensures UUID is registered
 const createClientActor = fromPromise<
@@ -230,14 +227,42 @@ const disconnectListenerActor = fromCallback<
 		}
 	};
 
-	// Subscribe to both disconnect and transport state changes
+	// Monitor peer connection state for data channel errors
+	// RTCDataChannel failures during processing may not trigger RTVI events,
+	// but they will cause the peer connection state to change to "failed" or "disconnected"
+	const transport = client.transport as SmallWebRTCTransport;
+	const peerConnection = (transport as unknown as { pc?: RTCPeerConnection })
+		.pc;
+
+	const handleConnectionStateChange = () => {
+		if (!peerConnection) return;
+		const state = peerConnection.connectionState;
+		console.debug("[XState] Peer connection state:", state);
+
+		if (state === "failed" || state === "disconnected") {
+			console.warn(
+				"[XState] Peer connection failed/disconnected, triggering reconnection",
+			);
+			sendBack({ type: "DISCONNECTED" });
+		}
+	};
+
+	// Subscribe to disconnect, transport state changes, and peer connection state
 	client.on(RTVIEvent.Disconnected, handleDisconnected);
 	client.on(RTVIEvent.TransportStateChanged, handleTransportStateChanged);
+	peerConnection?.addEventListener(
+		"connectionstatechange",
+		handleConnectionStateChange,
+	);
 
 	// Cleanup function
 	return () => {
 		client.off(RTVIEvent.Disconnected, handleDisconnected);
 		client.off(RTVIEvent.TransportStateChanged, handleTransportStateChanged);
+		peerConnection?.removeEventListener(
+			"connectionstatechange",
+			handleConnectionStateChange,
+		);
 	};
 });
 
@@ -267,8 +292,9 @@ export const connectionMachine = setup({
 		},
 		cleanupClient: ({ context }): void => {
 			if (!context.client) return;
-
-			closePeerConnectionImmediately(context.client);
+			// Clear the keepAliveInterval manually since the library's cleanup is buggy
+			// (the "close" event never fires when the PC is already dead)
+			clearKeepAliveInterval(context.client);
 			context.client.disconnect().catch(() => {});
 		},
 		logState: (_, params: { state: string }): void => {
@@ -443,6 +469,15 @@ export const connectionMachine = setup({
 					actions: "cleanupClient",
 				},
 				STOP_RECORDING: "processing",
+				// Handle manual reconnect during recording
+				RECONNECT: {
+					target: "initializing",
+					actions: [
+						"cleanupClient",
+						"emitReconnectStarted",
+						assign({ client: () => null, retryCount: () => 0 }),
+					],
+				},
 			},
 		},
 
@@ -469,6 +504,15 @@ export const connectionMachine = setup({
 					actions: "cleanupClient",
 				},
 				RESPONSE_RECEIVED: "idle",
+				// Handle manual reconnect during processing
+				RECONNECT: {
+					target: "initializing",
+					actions: [
+						"cleanupClient",
+						"emitReconnectStarted",
+						assign({ client: () => null, retryCount: () => 0 }),
+					],
+				},
 			},
 		},
 

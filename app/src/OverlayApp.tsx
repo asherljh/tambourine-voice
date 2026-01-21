@@ -207,6 +207,14 @@ function RecordingControl() {
 			}
 		}, SERVER_RESPONSE_TIMEOUT_MS);
 
+	// Clear response timeout when leaving processing state (reconnection, disconnection, etc.)
+	// This prevents the timeout from firing after we've already transitioned away
+	useEffect(() => {
+		if (displayState !== "processing") {
+			clearResponseTimeout();
+		}
+	}, [displayState, clearResponseTimeout]);
+
 	// Auto-resize window to fit content using Mantine's useResizeObserver
 	useEffect(() => {
 		if (rect.width > 0 && rect.height > 0) {
